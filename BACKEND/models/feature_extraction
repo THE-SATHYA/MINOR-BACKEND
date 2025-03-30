@@ -1,0 +1,91 @@
+import librosa
+import librosa.display
+import numpy as np
+import torch
+import torchaudio.transforms as T
+import pickle
+import os
+from concurrent.futures import ThreadPoolExecutor  # Use ThreadPoolExecutor for Windows
+
+def extract_features(file_path, sr=16000, n_mfcc=13, n_mels=128):
+   
+    try:
+        # Load audio (force mono to avoid multi-channel issues)
+        y, sr = librosa.load(file_path, sr=sr, mono=True)
+       
+        if len(y) == 0:
+            print(f"Warning: Empty audio file {file_path}")
+            return None, None
+       
+        # Compute MFCCs and normalize per feature dimension
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+        mfccs = (mfccs - np.mean(mfccs, axis=1, keepdims=True)) / (np.std(mfccs, axis=1, keepdims=True) + 1e-6)
+       
+        # Compute Mel spectrogram
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels)
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+       
+        # Convert to tensor for SpecAugment
+        mel_spec_aug = torch.tensor(mel_spec_db, dtype=torch.float32).unsqueeze(0)  # Add batch dim
+       
+        # Apply SpecAugment only if dimensions allow
+        if mel_spec_db.shape[1] > 1 and mel_spec_db.shape[0] > 1:
+            time_mask = T.TimeMasking(time_mask_param=min(30, mel_spec_db.shape[1] // 2))
+            freq_mask = T.FrequencyMasking(freq_mask_param=min(20, mel_spec_db.shape[0] // 2))
+            mel_spec_aug = time_mask(mel_spec_aug)
+            mel_spec_aug = freq_mask(mel_spec_aug)
+
+        mel_spec_aug = mel_spec_aug.squeeze(0).numpy()  # Remove batch dim
+       
+        return mfccs, mel_spec_aug
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return None, None
+
+def process_file(file_path):
+    """Helper function for parallel processing."""
+    file_name = os.path.basename(file_path)
+    mfccs, mel_spec = extract_features(file_path)
+    if mfccs is not None and mel_spec is not None:
+        return file_name, {"mfccs": mfccs, "mel_spec": mel_spec}
+    return None
+
+def process_dataset(dataset_path, output_file, use_parallel=True):
+   
+    feature_dict = {}
+    file_paths = [os.path.join(dataset_path, f) for f in os.listdir(dataset_path) if f.endswith(".wav")]
+
+    if len(file_paths) == 0:
+        print(f"No .wav files found in {dataset_path}")
+        return
+
+    if use_parallel:
+        print(f"Processing {len(file_paths)} files in parallel...")
+        with ThreadPoolExecutor() as executor:  # Use ThreadPoolExecutor for Windows
+            results = list(executor.map(process_file, file_paths))
+        for result in results:
+            if result:
+                file_name, features = result
+                feature_dict[file_name] = features
+    else:
+        print(f"Processing {len(file_paths)} files sequentially...")
+        for file_path in file_paths:
+            result = process_file(file_path)
+            if result:
+                file_name, features = result
+                feature_dict[file_name] = features
+   
+    if len(feature_dict) == 0:
+        print("No features were extracted. Please check the dataset and logs for errors.")
+        return
+   
+    # Save features incrementally to avoid memory issues
+    with open(output_file, "wb") as f:
+        pickle.dump(feature_dict, f)
+   
+    print(f"Saved extracted features to {output_file} with {len(feature_dict)} entries.")
+
+if __name__ == "__main__":
+    dataset_path = "C:/Users/SATHYA/Documents/new/multi/pressed"
+    output_file = "test.pkl"
+    process_dataset(dataset_path, output_file, use_parallel=True)
